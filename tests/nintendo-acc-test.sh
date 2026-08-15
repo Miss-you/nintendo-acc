@@ -102,11 +102,13 @@ if declare -F build_launchctl_args >/dev/null 2>&1; then
   build_launchctl_args "/opt/homebrew/bin/gost" "io.local.nintendo-acc" "/tmp/nintendo-acc.log"
   assert_equals "uses launchctl submit" "submit" "${LAUNCHCTL_ARGS[0]}"
   assert_equals "sets the launchctl service label" "io.local.nintendo-acc" "${LAUNCHCTL_ARGS[2]}"
-  assert_equals "passes GOST as the managed executable" "/opt/homebrew/bin/gost" "${LAUNCHCTL_ARGS[8]}"
+  assert_equals "prevents idle sleep with caffeinate" "/usr/bin/caffeinate" "${LAUNCHCTL_ARGS[8]}"
+  assert_equals "uses the idle-sleep assertion" "-i" "${LAUNCHCTL_ARGS[9]}"
+  assert_equals "passes GOST as the managed executable" "/opt/homebrew/bin/gost" "${LAUNCHCTL_ARGS[10]}"
   assert_equals "preserves the listener in launchctl arguments" \
-    "http://${TEST_LISTEN_HOST}:${TEST_LISTEN_PORT}" "${LAUNCHCTL_ARGS[10]}"
+    "http://${TEST_LISTEN_HOST}:${TEST_LISTEN_PORT}" "${LAUNCHCTL_ARGS[12]}"
   assert_equals "preserves the upstream in launchctl arguments" \
-    "$TEST_UPSTREAM_URL" "${LAUNCHCTL_ARGS[12]}"
+    "$TEST_UPSTREAM_URL" "${LAUNCHCTL_ARGS[14]:-}"
 else
   fail "launchctl argument builder exists"
 fi
@@ -166,6 +168,39 @@ else
   else
     pass "rejects an unknown command"
   fi
+
+  MISSING_CONFIG="$TEST_TMP_DIR/missing.env"
+  missing_output="$(NINTENDO_ACC_CONFIG="$MISSING_CONFIG" "$CLI_FILE" switch 2>&1)"
+  if [[ $? -eq 0 ]]; then
+    fail "requires setup when local config is missing"
+  else
+    pass "requires setup when local config is missing"
+  fi
+  assert_contains "explains how to generate missing config" "$missing_output" "bin/nintendo-acc setup"
+
+  GENERATED_CONFIG="$TEST_TMP_DIR/generated.env"
+  setup_output="$(
+    NINTENDO_ACC_CONFIG="$GENERATED_CONFIG" \
+    NINTENDO_ACC_INTERFACE="en7" \
+    NINTENDO_ACC_LISTEN_HOST="$TEST_LISTEN_HOST" \
+    NINTENDO_ACC_LISTEN_PORT="$TEST_LISTEN_PORT" \
+    NINTENDO_ACC_UPSTREAM_URL="$TEST_UPSTREAM_URL" \
+      "$CLI_FILE" setup 2>&1
+  )"
+  setup_status=$?
+  if [[ $setup_status -eq 0 && -f "$GENERATED_CONFIG" ]]; then
+    pass "setup creates a machine-local config from explicit overrides"
+  else
+    fail "setup creates a machine-local config from explicit overrides"
+  fi
+  if [[ -f "$GENERATED_CONFIG" ]]; then
+    generated_content="$(sed -n '1,120p' "$GENERATED_CONFIG")"
+  else
+    generated_content=""
+  fi
+  assert_contains "setup writes the target interface" "$generated_content" "LISTEN_INTERFACE=en7"
+  assert_contains "setup writes the target private address" "$generated_content" "LISTEN_HOST=$TEST_LISTEN_HOST"
+  assert_contains "setup reports the Switch server" "$setup_output" "服务器：$TEST_LISTEN_HOST"
 fi
 
 EXAMPLE_CONFIG="$ROOT_DIR/config/nintendo-acc.env.example"

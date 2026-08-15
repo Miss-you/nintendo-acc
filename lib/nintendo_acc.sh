@@ -169,6 +169,8 @@ build_launchctl_args() {
     -o "$log_file"
     -e "$log_file"
     --
+    /usr/bin/caffeinate
+    -i
     "$gost_bin"
     "${GOST_ARGS[@]}"
   )

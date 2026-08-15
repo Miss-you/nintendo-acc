@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG_FILE="${NINTENDO_ACC_CONFIG:-$ROOT_DIR/config/nintendo-acc.env}"
+RUNTIME_DIR="${NINTENDO_ACC_RUNTIME_DIR:-$ROOT_DIR/.runtime}"
+LOG_FILE="$RUNTIME_DIR/gost.log"
+LEGACY_PID_FILE="$RUNTIME_DIR/gost.pid"
+SERVICE_LABEL="${NINTENDO_ACC_SERVICE_LABEL:-io.local.nintendo-acc-gost}"
+
+# shellcheck source=../lib/nintendo_acc.sh
+source "$ROOT_DIR/lib/nintendo_acc.sh"
+
+usage() {
+  cat <<'EOF'
+用法：bin/nintendo-acc <命令>
+
+命令：
+  setup      检测本机网络与上游代理，生成不入库的本地配置
+  preflight  检查 GOST、Mac 地址、Clash 上游和监听端口
+  start      启动后台 GOST 代理
+  stop       停止由本工具启动的 GOST 代理
+  status     查看运行状态
+  test       通过本地代理访问 HTTPS 探测地址
+  switch     打印 Switch 2 应填写的代理参数
+  logs       显示最近 50 行 GOST 日志
+EOF
+}
+
+load_config() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    printf '找不到配置文件：%s\n请先运行：bin/nintendo-acc setup\n' "$CONFIG_FILE" >&2
+    return 1
+  fi
+
+  # 配置文件由本项目维护，只包含简单的 KEY=value。
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+  GOST_BIN="${GOST_BIN:-gost}"
+  PROBE_URL="${PROBE_URL:-https://www.nintendo.com/robots.txt}"
+
+  if [[ -z "${LISTEN_INTERFACE:-}" || -z "${LISTEN_HOST:-}" || \
+        -z "${LISTEN_PORT:-}" || -z "${UPSTREAM_URL:-}" ]]; then
+    printf '配置缺少 LISTEN_INTERFACE、LISTEN_HOST、LISTEN_PORT 或 UPSTREAM_URL。\n' >&2
+    return 1
+  fi
+  validate_config "$LISTEN_HOST" "$LISTEN_PORT" "$UPSTREAM_URL"
+}
+
+setup_config() {
+  local force="${1:-}"
+  if [[ -f "$CONFIG_FILE" && "$force" != "--force" ]]; then
+    printf '本地配置已存在：%s\n如需重新检测，请运行：bin/nintendo-acc setup --force\n' \
+      "$CONFIG_FILE" >&2
+    return 1
+  fi
+
+  local interface_name="${NINTENDO_ACC_INTERFACE:-}"
+  local listen_host="${NINTENDO_ACC_LISTEN_HOST:-}"
+  local listen_port="${NINTENDO_ACC_LISTEN_PORT:-18080}"
+  local upstream_url="${NINTENDO_ACC_UPSTREAM_URL:-}"
+
+  if [[ -z "$interface_name" ]]; then
+    interface_name="$(detect_default_interface)" || {
+      printf '无法检测默认网络接口；请设置 NINTENDO_ACC_INTERFACE 后重试。\n' >&2
+      return 1
+    }
+  fi
+  if [[ ! "$interface_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    printf '检测到无效网络接口：%s\n' "$interface_name" >&2
+    return 1
+  fi
+
+  if [[ -z "$listen_host" ]]; then
+    listen_host="$(detect_interface_ipv4 "$interface_name")" || {
+      printf '接口 %s 没有可用 IPv4；请设置 NINTENDO_ACC_LISTEN_HOST 后重试。\n' \
+        "$interface_name" >&2
+      return 1
+    }
+  fi
+
+  if [[ -z "$upstream_url" ]]; then
+    upstream_url="$(detect_upstream_url)" || {
+      printf '未找到可用的本地 Clash/Mihomo 端口。请启动代理核心，或设置 NINTENDO_ACC_UPSTREAM_URL。\n' >&2
+      return 1
+    }
+  fi
+
+  validate_config "$listen_host" "$listen_port" "$upstream_url" || return 1
+
+  local config_dir temporary_config
+  config_dir="$(dirname "$CONFIG_FILE")"
+  mkdir -p "$config_dir"
+  temporary_config="$(mktemp "$config_dir/.nintendo-acc.env.XXXXXX")" || return 1
+  if ! render_config "$interface_name" "$listen_host" "$listen_port" "$upstream_url" \
+    >"$temporary_config"; then
+    rm -f "$temporary_config"
+    return 1
+  fi
+  chmod 600 "$temporary_config"
+  mv "$temporary_config" "$CONFIG_FILE"
+
+  printf '本地配置已生成：%s\n' "$CONFIG_FILE"
+  show_switch_config
+}
+
+read_pid() {
+  local job_info
+  job_info="$(launchctl list "$SERVICE_LABEL" 2>/dev/null)" || return 1
+  PID_VALUE="$(printf '%s\n' "$job_info" | awk '/"PID"/ { gsub(/;/, "", $3); print $3; exit }')"
+  [[ "$PID_VALUE" =~ ^[0-9]+$ ]] || return 1
+}
+
+is_running() {
+  read_pid || return 1
+  kill -0 "$PID_VALUE" 2>/dev/null
+}
+
+job_exists() {
+  launchctl list "$SERVICE_LABEL" >/dev/null 2>&1
+}
+
+listener_exists() {
+  lsof -nP -iTCP:"$LISTEN_PORT" -sTCP:LISTEN -t 2>/dev/null | grep -q .
+}
+
+preflight() {
+  load_config || return 1
+
+  if ! command -v "$GOST_BIN" >/dev/null 2>&1; then
+    printf '未找到 GOST。请先运行：brew install gost\n' >&2
+    return 1
+  fi
+
+  if ! ifconfig "$LISTEN_INTERFACE" 2>/dev/null | awk -v target="$LISTEN_HOST" \
+    '$1 == "inet" && $2 == target { found=1 } END { exit(found ? 0 : 1) }'; then
+    printf '接口 %s 当前没有地址 %s；Wi-Fi 变化后请更新 %s。\n' \
+      "$LISTEN_INTERFACE" "$LISTEN_HOST" "$CONFIG_FILE" >&2
+    return 1
+  fi
+
+  parse_upstream_url "$UPSTREAM_URL" || return 1
+  if ! nc -z -w 2 "$UPSTREAM_HOST" "$UPSTREAM_PORT" >/dev/null 2>&1; then
+    printf '上游 %s:%s 未监听。请先打开 Clash Verge 并启动系统代理/核心。\n' \
+      "$UPSTREAM_HOST" "$UPSTREAM_PORT" >&2
+    return 1
+  fi
+
+  if ! is_running && listener_exists; then
+    printf '端口 %s 已被其他进程监听，请修改 LISTEN_PORT。\n' "$LISTEN_PORT" >&2
+    return 1
+  fi
+
+  printf '预检通过：%s:%s -> %s\n' \
+    "$LISTEN_HOST" "$LISTEN_PORT" "$(redact_url "$UPSTREAM_URL")"
+}
+
+start_proxy() {
+  load_config || return 1
+  if is_running; then
+    printf 'GOST 已在运行（PID %s）。\n' "$PID_VALUE"
+    return 0
+  fi
+
+  if job_exists; then
+    launchctl remove "$SERVICE_LABEL" >/dev/null 2>&1 || true
+  fi
+  preflight || return 1
+  mkdir -p "$RUNTIME_DIR"
+  rm -f "$LEGACY_PID_FILE"
+  local gost_path
+  gost_path="$(command -v "$GOST_BIN")"
+  build_launchctl_args "$gost_path" "$SERVICE_LABEL" "$LOG_FILE"
+  if ! launchctl "${LAUNCHCTL_ARGS[@]}"; then
+    printf '无法向 launchctl 提交 GOST 服务。\n' >&2
+    return 1
+  fi
+
+  local attempt
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if read_pid && listener_exists; then
+      printf 'GOST 已启动（PID %s）：http://%s:%s\n' \
+        "$PID_VALUE" "$LISTEN_HOST" "$LISTEN_PORT"
+      return 0
+    fi
+    if ! job_exists; then
+      break
+    fi
+    sleep 0.1
+  done
+
+  launchctl remove "$SERVICE_LABEL" >/dev/null 2>&1 || true
+  printf 'GOST 启动失败，最近日志：\n' >&2
+  tail -n 20 "$LOG_FILE" 2>/dev/null >&2
+  return 1
+}
+
+stop_proxy() {
+  load_config || return 1
+  if ! job_exists; then
+    rm -f "$LEGACY_PID_FILE"
+    printf 'GOST 未运行。\n'
+    return 0
+  fi
+
+  local pid="unknown"
+  if read_pid; then
+    pid="$PID_VALUE"
+  fi
+  if ! launchctl remove "$SERVICE_LABEL"; then
+    printf '无法停止 launchctl 服务 %s。\n' "$SERVICE_LABEL" >&2
+    return 1
+  fi
+  local attempt
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if ! job_exists; then
+      rm -f "$LEGACY_PID_FILE"
+      printf 'GOST 已停止。\n'
+      return 0
+    fi
+    sleep 0.1
+  done
+  printf 'GOST 未能在 2 秒内停止（原 PID %s），请检查 launchctl。\n' "$pid" >&2
+  return 1
+}
+
+show_status() {
+  load_config || return 1
+  if is_running; then
+    printf '运行中：PID %s，http://%s:%s\n' "$PID_VALUE" "$LISTEN_HOST" "$LISTEN_PORT"
+  else
+    printf '未运行。\n'
+    return 1
+  fi
+}
+
+test_proxy() {
+  load_config || return 1
+  if ! is_running; then
+    printf 'GOST 未运行，请先执行 bin/nintendo-acc start。\n' >&2
+    return 1
+  fi
+
+  local status
+  status="$(curl --proxy "http://${LISTEN_HOST}:${LISTEN_PORT}" \
+    --connect-timeout 8 --max-time 20 --silent --show-error \
+    --output /dev/null --write-out '%{http_code}' "$PROBE_URL")" || return 1
+  if [[ "$status" == "000" ]]; then
+    printf '代理探测失败：HTTP %s\n' "$status" >&2
+    return 1
+  fi
+  printf '代理探测成功：%s 返回 HTTP %s。\n' "$PROBE_URL" "$status"
+}
+
+show_switch_config() {
+  load_config || return 1
+  cat <<EOF
+Switch 2 代理设置：
+  代理设置：开启
+  服务器：$LISTEN_HOST
+  端口：$LISTEN_PORT
+  认证：关闭
+EOF
+}
+
+show_logs() {
+  if [[ ! -f "$LOG_FILE" ]]; then
+    printf '尚无日志：%s\n' "$LOG_FILE"
+    return 0
+  fi
+  tail -n 50 "$LOG_FILE"
+}
+
+case "${1:-}" in
+  setup) setup_config "${2:-}" ;;
+  preflight) preflight ;;
+  start) start_proxy ;;
+  stop) stop_proxy ;;
+  status) show_status ;;
+  test) test_proxy ;;
+  switch) show_switch_config ;;
+  logs) show_logs ;;
+  help|-h|--help) usage ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
