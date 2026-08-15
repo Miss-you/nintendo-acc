@@ -1,0 +1,3 @@
+.runtime/
+.worktrees/
+config/nintendo-acc.env
