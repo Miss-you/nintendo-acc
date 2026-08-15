@@ -60,6 +60,17 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local description="$1"
+  local haystack="$2"
+  local needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    fail "$description (unexpected: $needle)"
+  else
+    pass "$description"
+  fi
+}
+
 if [[ ! -f "$LIB_FILE" ]]; then
   printf 'not ok 1 - library exists (%s)\n' "$LIB_FILE"
   exit 1
@@ -71,6 +82,7 @@ source "$LIB_FILE"
 TEST_LISTEN_HOST="192.168.50.20"
 TEST_LISTEN_PORT="18080"
 TEST_UPSTREAM_URL="socks5://127.0.0.1:7890"
+SOURCE_MACHINE_IP="$(printf '%s.%s.%s.%s' 192 168 31 166)"
 
 assert_success "accepts the intended private-LAN configuration" \
   validate_config "$TEST_LISTEN_HOST" "$TEST_LISTEN_PORT" "$TEST_UPSTREAM_URL"
@@ -209,7 +221,7 @@ if [[ ! -f "$EXAMPLE_CONFIG" ]]; then
 else
   example_content="$(sed -n '1,120p' "$EXAMPLE_CONFIG")"
   assert_contains "leaves the example listener address empty" "$example_content" "LISTEN_HOST="
-  if [[ "$example_content" == *"192.168.31.166"* ]]; then
+  if [[ "$example_content" == *"$SOURCE_MACHINE_IP"* ]]; then
     fail "does not publish the source Mac address"
   else
     pass "does not publish the source Mac address"
@@ -229,10 +241,47 @@ else
   readme_content="$(sed -n '1,260p' "$README_FILE")"
   assert_contains "documents GOST installation" "$readme_content" "brew install gost"
   assert_contains "documents Clash startup" "$readme_content" "Clash Verge"
+  assert_contains "documents repository cloning" "$readme_content" \
+    "git clone https://github.com/Miss-you/nintendo-acc.git"
+  assert_contains "documents automatic local setup" "$readme_content" "bin/nintendo-acc setup"
   assert_contains "documents the start command" "$readme_content" "bin/nintendo-acc start"
-  assert_contains "documents the Switch server address" "$readme_content" "192.168.31.166"
+  assert_contains "documents generated Switch settings" "$readme_content" "bin/nintendo-acc switch"
   assert_contains "documents Switch proxy authentication" "$readme_content" "认证"
   assert_contains "documents shutdown" "$readme_content" "bin/nintendo-acc stop"
+  assert_contains "documents sleep prevention" "$readme_content" "caffeinate -i"
+  assert_contains "links the target-agent prompt" "$readme_content" "PROMPT.md"
+  assert_contains "links the agent rules" "$readme_content" "AGENTS.md"
+  assert_not_contains "does not publish the source Mac IP in README" \
+    "$readme_content" "$SOURCE_MACHINE_IP"
+fi
+
+PROMPT_FILE="$ROOT_DIR/PROMPT.md"
+if [[ ! -f "$PROMPT_FILE" ]]; then
+  fail "target-agent prompt exists"
+else
+  prompt_content="$(sed -n '1,320p' "$PROMPT_FILE")"
+  assert_contains "prompt requires reading AGENTS.md" "$prompt_content" "AGENTS.md"
+  assert_contains "prompt clones the public repository" "$prompt_content" \
+    "git clone https://github.com/Miss-you/nintendo-acc.git"
+  assert_contains "prompt runs automatic setup" "$prompt_content" "bin/nintendo-acc setup"
+  assert_contains "prompt verifies the HTTPS chain" "$prompt_content" "bin/nintendo-acc test"
+  assert_contains "prompt requires approval for system changes" "$prompt_content" "请求用户确认"
+  assert_contains "prompt forbids hardcoded machine IPs" "$prompt_content" "不得硬编码"
+fi
+
+AGENTS_FILE="$ROOT_DIR/AGENTS.md"
+if [[ ! -f "$AGENTS_FILE" ]]; then
+  fail "canonical AGENTS.md exists"
+else
+  agents_content="$(sed -n '1,360p' "$AGENTS_FILE")"
+  assert_contains "agent rules require Bash syntax checks" "$agents_content" \
+    "bash -n bin/nintendo-acc lib/nintendo_acc.sh tests/nintendo-acc-test.sh"
+  assert_contains "agent rules require the test suite" "$agents_content" \
+    "bash tests/nintendo-acc-test.sh"
+  assert_contains "agent rules forbid wildcard listeners" "$agents_content" "0.0.0.0"
+  assert_contains "agent rules protect local config" "$agents_content" "config/nintendo-acc.env"
+  assert_contains "agent rules preserve sleep protection" "$agents_content" "caffeinate -i"
+  assert_contains "agent rules prohibit secrets" "$agents_content" "订阅 URL"
 fi
 
 if (( TESTS_FAILED > 0 )); then
